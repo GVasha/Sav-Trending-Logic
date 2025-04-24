@@ -4,6 +4,7 @@ import numpy as np
 import requests
 from sklearn.preprocessing import StandardScaler, MinMaxScaler
 import re
+from sklearn.metrics.pairwise import cosine_similarity
 
 # Set random seed for reproducibility
 np.random.seed(42)
@@ -121,79 +122,91 @@ df['category'] = df.apply(lambda row: row['category'] if row['category'] != 'und
 
 # --- Step 2: Feature Engineering ---
 # Basic engagement metrics
-df['like_ratio'] = df['likes'] / (df['likes'] + df['dislikes'])
+df['like_ratio'] = df['likes'] / (df['likes'] + df['dislikes'] + 1)  # Add 1 to avoid division by zero
 df['engagement'] = df['likes'] + df['dislikes']
-df['completion_rate'] = df['watch_time'] / (df['cooking_time'] * 60)
+df['completion_rate'] = df['watch_time'] / (df['cooking_time'] * 60 + 1)  # Add 1 to avoid division by zero
 df['nutrient_balance'] = np.exp(-(np.abs(df['carbs'] - 50) + np.abs(df['fats'] - 25) + np.abs(df['proteins'] - 25))/100)
 df['ingredient_complexity'] = df['ingredient_count'] / 10  # Normalized ingredient count
-
-# Add more weight to ratings and likes
-df['weighted_rating'] = df['rating'] ** 2  # Square the rating to emphasize high ratings
-df['normalized_likes'] = np.log1p(df['likes'])  # Log-transform likes to handle skewed distribution
-df['normalized_views'] = np.log1p(df['views'])  # Log-transform views to handle skewed distribution
-df['engagement_factor'] = (df['likes'] + df['comments'] + 3*df['shares']) / (df['views'] + 1)  # Engagement as percentage of views
 df['social_score'] = df['shares'] + df['comments']  # Combined social metrics
+df['engagement_factor'] = (df['likes'] + df['comments'] + 3*df['shares']) / (df['views'] + 1)  # Engagement as percentage of views
 
-# --- Step 3: Advanced Ranking Algorithm ---
-# Create normalized features
-scaler = MinMaxScaler()
+# --- Step 3: Eigenvalue-Based Ranking Algorithm ---
+# Normalize the feature data for better comparison
+scaler = StandardScaler()
+features = [
+    'views', 'likes', 'rating', 'social_score', 
+    'engagement_factor', 'like_ratio', 'completion_rate', 
+    'difficulty', 'cooking_time'
+]
 
-# Select features for normalization with major emphasis on ratings, likes, views and engagement
-engagement_features = ['views', 'normalized_views', 'likes', 'normalized_likes', 'comments', 'shares', 'social_score', 'engagement_factor']
-quality_features = ['like_ratio', 'rating', 'weighted_rating', 'completion_rate', 'nutrient_balance'] 
-complexity_features = ['difficulty', 'cooking_time', 'ingredient_complexity']
+# Create a copy of the feature data for scaling
+feature_data = df[features].copy()
+feature_data_scaled = scaler.fit_transform(feature_data)
 
-# Normalize different feature groups
-engagement_scaled = scaler.fit_transform(df[engagement_features])
-quality_scaled = scaler.fit_transform(df[quality_features])
-# Invert complexity so lower values (easier/faster) are better
-complexity_scaled = -1 * scaler.fit_transform(df[complexity_features])
-trend_scaled = scaler.fit_transform(df[['trend_factor']])
+# Get number of recipes
+n = len(df)
 
-# Create component scores with much higher weights for rating, likes, views and engagement
-# And much lower weights for complexity factors
-df['engagement_score'] = np.average(engagement_scaled, axis=1, 
-                                  weights=[0.10, 0.15, 0.20, 0.20, 0.10, 0.10, 0.05, 0.10])  # 80% combined weight on views and likes
+# Calculate similarity matrix using cosine similarity
+similarity_matrix = cosine_similarity(feature_data_scaled)
 
-df['quality_score'] = np.average(quality_scaled, axis=1, 
-                               weights=[0.15, 0.35, 0.40, 0.05, 0.05])  # 75% combined weight on rating and weighted rating
+# Create recipe transition matrix (similar to how PageRank works)
+# Higher engagement and quality means more likely to transition to that recipe
+engagement_influence = np.zeros((n, n))
+for i in range(n):
+    for j in range(n):
+        if i != j:  # Don't compare recipe to itself
+            # Calculate how much recipe j influences recipe i
+            # based on engagement and similarity
+            engagement_influence[i, j] = (
+                df.iloc[j]['likes'] / df['likes'].mean() *
+                df.iloc[j]['views'] / df['views'].mean() *
+                df.iloc[j]['rating'] / df['rating'].mean() *
+                max(0.1, similarity_matrix[i, j])  # Ensure non-zero probability
+            )
 
-df['accessibility_score'] = np.average(complexity_scaled, axis=1, 
-                                     weights=[0.20, 0.20, 0.60])  # Much less weight to difficulty and cooking time (40% combined vs 80% before)
+# Normalize rows to create proper transition probabilities
+row_sums = engagement_influence.sum(axis=1)
+transition_matrix = engagement_influence / row_sums[:, np.newaxis]
 
-df['trend_score'] = trend_scaled.flatten()
+# Add damping factor (like in PageRank algorithm)
+damping = 0.85
+random_surf_prob = (1 - damping) / n
+transition_matrix = damping * transition_matrix + random_surf_prob
 
-# Define weights for overall score - dramatically increase weight on engagement and quality
-score_weights = {
-    'engagement': 0.50,  # Increased to 50% (from 40%)
-    'quality': 0.40,     # Increased to 40% (from 35%)
-    'trend': 0.08,       # Decreased to 8% (from 15%)
-    'accessibility': 0.02 # Dramatically decreased to 2% (from 10%)
-}
+# Power iteration method to find the principal eigenvector
+# (simpler than full eigendecomposition for this purpose)
+v = np.ones(n) / n  # Initial uniform probability
+tolerance = 1e-8
+max_iterations = 100
+for _ in range(max_iterations):
+    v_prev = v
+    v = np.dot(transition_matrix.T, v)
+    # Check for convergence
+    if np.linalg.norm(v - v_prev) < tolerance:
+        break
 
-# Calculate final score
-df['final_score'] = (
-    score_weights['engagement'] * df['engagement_score'] +
-    score_weights['quality'] * df['quality_score'] +
-    score_weights['trend'] * df['trend_score'] +
-    score_weights['accessibility'] * df['accessibility_score']
-)
+# Normalize the eigenvector to get scores between 0 and 1
+df['eigenrank_score'] = v / max(v)
 
-# Sort recipes by final score
-df = df.sort_values('final_score', ascending=False).reset_index(drop=True)
+# Sort recipes by eigenvalue score
+df = df.sort_values('eigenrank_score', ascending=False).reset_index(drop=True)
+
+# Store component scores for display
+df['quality_score'] = df['rating'] / 5.0
+df['engagement_score'] = df['engagement_factor']
 
 # --- Step 4: Output Top 20 Ranked Recipes ---
 print("\n" + "="*80)
-print("🏆 TOP 20 RANKED RECIPES 🏆".center(80))
+print("🏆 TOP 20 RANKED RECIPES (EIGENVALUE RANKING) 🏆".center(80))
 print("="*80)
 
 for i, row in df.head(20).iterrows():
-    print(f"{i+1}. {row['title']} ({row['category']}) - Score: {row['final_score']:.2f}")
+    print(f"{i+1}. {row['title']} ({row['category']}) - Score: {row['eigenrank_score']:.2f}")
     print(f"   RATING: ★{row['rating']:.1f}/5.0 | LIKES: {int(row['likes']):,} | VIEWS: {int(row['views']):,}")
     print(f"   Engagement Factor: {row['engagement_factor']*100:.1f}% | Social: {int(row['social_score']):,}")
     print(f"   Author: {row['author']} | Quality: {row['quality_score']:.2f} | Engagement: {row['engagement_score']:.2f}")
     print()
 
 # Save results
-df.to_csv('ranked_recipes.csv', index=False)
-print("\nTop 20 recipes saved to ranked_recipes.csv")
+df.to_csv('ranked_recipes_eigenvalue.csv', index=False)
+print("\nTop 20 recipes saved to ranked_recipes_eigenvalue.csv")
